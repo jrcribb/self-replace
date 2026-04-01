@@ -1,31 +1,75 @@
-use std::env::consts::EXE_EXTENSION;
+use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::{env, fs};
+use std::sync::{Once, RwLock};
 
-fn compile_example(name: &str) {
+static BUILT_EXAMPLES_INIT: Once = Once::new();
+static BUILT_EXAMPLES: RwLock<Option<HashMap<String, PathBuf>>> = RwLock::new(None);
+
+fn compile_examples() -> HashMap<String, PathBuf> {
     let mut cmd = Command::new("cargo");
     let output = cmd
         .arg("build")
-        .arg("--example")
-        .arg(name)
+        .arg("--examples")
+        .arg("--message-format=json-render-diagnostics")
         .output()
         .unwrap();
-    println!("stdout:\n{}", String::from_utf8_lossy(&output.stdout));
-    println!("stderr:\n{}", String::from_utf8_lossy(&output.stderr));
-    assert!(output.status.success());
+
+    if !output.status.success() {
+        println!("stdout:\n{}", String::from_utf8_lossy(&output.stdout));
+        println!("stderr:\n{}", String::from_utf8_lossy(&output.stderr));
+        panic!("cargo build --examples failed");
+    }
+
+    let mut rv = HashMap::new();
+
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+
+        let is_example = message
+            .get("target")
+            .and_then(|target| target.get("kind"))
+            .and_then(|kind| kind.as_array())
+            .map_or(false, |kinds| {
+                kinds.iter().any(|kind| kind.as_str() == Some("example"))
+            });
+
+        let built_name = message
+            .get("target")
+            .and_then(|target| target.get("name"))
+            .and_then(|name| name.as_str());
+
+        let executable = message.get("executable").and_then(|exe| exe.as_str());
+
+        if is_example && built_name.is_some() && executable.is_some() {
+            rv.insert(
+                built_name.unwrap().to_string(),
+                PathBuf::from(executable.unwrap()),
+            );
+        }
+    }
+
+    rv
 }
 
-fn get_executable(name: &str, tempdir: &Path) -> PathBuf {
-    let exe = env::current_exe()
+fn compile_example(name: &str) -> PathBuf {
+    BUILT_EXAMPLES_INIT.call_once(|| {
+        *BUILT_EXAMPLES.write().unwrap() = Some(compile_examples());
+    });
+
+    BUILT_EXAMPLES
+        .read()
         .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("examples")
-        .join(name)
-        .with_extension(EXE_EXTENSION);
+        .as_ref()
+        .and_then(|examples| examples.get(name))
+        .cloned()
+        .unwrap_or_else(|| panic!("could not locate built executable for example {}", name))
+}
+
+fn get_executable(exe: &Path, tempdir: &Path) -> PathBuf {
     let final_exe = tempdir.join(exe.file_name().unwrap());
     fs::copy(&exe, &final_exe).unwrap();
     final_exe
@@ -75,8 +119,8 @@ fn run(opts: RunOptions) {
 fn test_self_delete() {
     let workspace = tempfile::tempdir().unwrap();
     let scratchspace = tempfile::tempdir().unwrap();
-    compile_example("deletes-itself");
-    let exe = get_executable("deletes-itself", workspace.path());
+    let built_exe = compile_example("deletes-itself");
+    let exe = get_executable(&built_exe, workspace.path());
     assert!(exe.is_file());
     run(RunOptions {
         path: &exe,
@@ -92,8 +136,8 @@ fn test_self_delete() {
 fn test_self_delete_force_exit() {
     let scratchspace = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
-    compile_example("deletes-itself");
-    let exe = get_executable("deletes-itself", workspace.path());
+    let built_exe = compile_example("deletes-itself");
+    let exe = get_executable(&built_exe, workspace.path());
     assert!(exe.is_file());
     run(RunOptions {
         path: &exe,
@@ -109,8 +153,8 @@ fn test_self_delete_force_exit() {
 fn test_self_delete_outside_path() {
     let scratchspace = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
-    compile_example("deletes-itself-outside-path");
-    let exe = get_executable("deletes-itself-outside-path", workspace.path());
+    let built_exe = compile_example("deletes-itself-outside-path");
+    let exe = get_executable(&built_exe, workspace.path());
     assert!(exe.is_file());
     assert!(workspace.path().is_dir());
     run(RunOptions {
@@ -128,8 +172,8 @@ fn test_self_delete_outside_path() {
 fn test_self_delete_outside_path_force_exit() {
     let scratchspace = tempfile::tempdir().unwrap();
     let workspace = tempfile::tempdir().unwrap();
-    compile_example("deletes-itself-outside-path");
-    let exe = get_executable("deletes-itself-outside-path", workspace.path());
+    let built_exe = compile_example("deletes-itself-outside-path");
+    let exe = get_executable(&built_exe, workspace.path());
     assert!(exe.is_file());
     assert!(workspace.path().is_dir());
     run(RunOptions {
@@ -149,11 +193,11 @@ fn test_self_replace() {
     let workspace = scratchspace.path().join("workspace");
     fs::create_dir_all(&workspace).unwrap();
 
-    compile_example("replaces-itself");
-    compile_example("hello");
+    let built_exe = compile_example("replaces-itself");
+    let built_hello = compile_example("hello");
 
-    let exe = get_executable("replaces-itself", &workspace);
-    let hello = get_executable("hello", &workspace);
+    let exe = get_executable(&built_exe, &workspace);
+    let hello = get_executable(&built_hello, &workspace);
 
     assert!(exe.is_file());
     assert!(hello.is_file());
@@ -183,11 +227,11 @@ fn test_self_replace_force_exit() {
     let workspace = scratchspace.path().join("workspace");
     fs::create_dir_all(&workspace).unwrap();
 
-    compile_example("replaces-itself");
-    compile_example("hello");
+    let built_exe = compile_example("replaces-itself");
+    let built_hello = compile_example("hello");
 
-    let exe = get_executable("replaces-itself", &workspace);
-    let hello = get_executable("hello", &workspace);
+    let exe = get_executable(&built_exe, &workspace);
+    let hello = get_executable(&built_hello, &workspace);
 
     assert!(exe.is_file());
     assert!(hello.is_file());
@@ -218,11 +262,11 @@ fn test_self_replace_through_symlink() {
     let workspace = scratchspace.path().join("workspace");
     fs::create_dir_all(&workspace).unwrap();
 
-    compile_example("replaces-itself");
-    compile_example("hello");
+    let built_exe = compile_example("replaces-itself");
+    let built_hello = compile_example("hello");
 
-    let exe = get_executable("replaces-itself", &workspace);
-    let hello = get_executable("hello", &workspace);
+    let exe = get_executable(&built_exe, &workspace);
+    let hello = get_executable(&built_hello, &workspace);
 
     let exe_symlink = workspace.join("bin").join("symlink");
     fs::create_dir_all(exe_symlink.parent().unwrap()).unwrap();
